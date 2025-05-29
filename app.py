@@ -9,6 +9,9 @@ import numpy as np
 from PIL import Image
 import torchvision.transforms as transforms
 from werkzeug.utils import secure_filename
+import gdown
+import glob
+import time
 
 # Initialize Flask App
 app = Flask(__name__)
@@ -45,16 +48,20 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.5], std=[0.5])
 ])
 
-def load_model(model_path):
+def load_model(model_url, model_path="best_hcec_hybrid_model_weights_only.pth"):
     from hybrid_model import HybridHCECModel
+    # Download model file from Google Drive if it doesn't exist
+    if not os.path.exists(model_path):
+        gdown.download(model_url, model_path, quiet=False)
     model = HybridHCECModel().to(device)
     checkpoint = torch.load(model_path, map_location=device)
     model.load_state_dict(checkpoint)  # Load directly, as the file contains the state dict
     model.eval()
     return model
 
-MODEL_PATH = r"E:\VScode\HCEC\best_hcec_hybrid_model_weights_only.pth"
-model = load_model(MODEL_PATH)
+# Model URL from Google Drive (direct download link)
+MODEL_URL = os.getenv("MODEL_URL", "https://drive.google.com/uc?export=download&id=1qLe4mGHlCDZvKfAPQoOpvJUVT9OLW6p0")
+model = load_model(MODEL_URL)
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp'}
 
@@ -159,7 +166,11 @@ def predict():
             denorm_output[2], 
             denorm_output[1] 
         )
+        # Clean up the uploaded file and old files in uploads directory
         os.remove(temp_path)
+        for old_file in glob.glob("uploads/*"):
+            if os.path.getmtime(old_file) < time.time() - 3600:  # Remove files older than 1 hour
+                os.remove(old_file)
         return jsonify({
             'cell_density': round(float(denorm_output[0]), 2), 
             'cv': round(float(denorm_output[1]), 2),         
