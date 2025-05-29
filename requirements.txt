@@ -7,3 +7,4 @@ pillow
 numpy
 gdown
 gunicorn
+transformers
