@@ -16,7 +16,7 @@ import gc
 
 # Initialize Flask App
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/predict": {"origins": ["http://localhost:5173", "https://*.vercel.app"]}})
 
 # Define Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
