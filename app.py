@@ -12,6 +12,7 @@ from werkzeug.utils import secure_filename
 import gdown
 import glob
 import time
+import gc
 
 # Initialize Flask App
 app = Flask(__name__)
@@ -38,7 +39,7 @@ def denormalize(values):
 
 class CLAHETransform:
     def __call__(self, img):
-        if len(img.shape) == 2:  
+        if len(img.shape) == 2:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             img = clahe.apply(img)
         return img
@@ -48,20 +49,22 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.5], std=[0.5])
 ])
 
-def load_model(model_url, model_path="best_hcec_hybrid_model_weights_only.pth"):
+def load_model(model_url, model_path="/opt/render/project/src/model_storage/best_hcec_hybrid_model_weights_only.pth"):
     from hybrid_model import HybridHCECModel
-    # Download model file from Google Drive if it doesn't exist
     if not os.path.exists(model_path):
         gdown.download(model_url, model_path, quiet=False)
     model = HybridHCECModel().to(device)
     checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint)  # Load directly, as the file contains the state dict
+    model.load_state_dict(checkpoint)
+    if device.type == "cpu":
+        model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
     model.eval()
+    gc.collect()  # Free memory after loading
     return model
 
-# Model URL from Google Drive (direct download link)
+# Model URL from Google Drive
 MODEL_URL = os.getenv("MODEL_URL", "https://drive.google.com/uc?export=download&id=1qLe4mGHlCDZvKfAPQoOpvJUVT9OLW6p0")
-model = load_model(MODEL_URL)
+model = None  # Lazy-load model
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp'}
 
@@ -72,12 +75,13 @@ def preprocess_image(image_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise ValueError("Error loading image")
+    image = cv2.resize(image, (224, 224))  # Resize early
     image = CLAHETransform()(image)
     image = np.stack([image] * 3, axis=-1)
-    image = cv2.resize(image, (224, 224))
     image = Image.fromarray(image)
     image = transform(image)
     image = image.unsqueeze(0).to(device)
+    gc.collect()  # Free memory
     return image
 
 def classify_prediction(cell_density, corneal_thickness, cv):
@@ -107,7 +111,7 @@ def classify_prediction(cell_density, corneal_thickness, cv):
         elif 450 <= corneal_thickness <= 600 and cv > 40:
             suggested_action = "Borderline case, polymegathism present, monitor for progression"
             surgery_type = "DMEK/DSAEK if symptoms worsen"
-        else:  
+        else:
             suggested_action = "Thick cornea, monitor for endothelial dysfunction"
             surgery_type = "Consider DSAEK if symptoms worsen"
     elif 2000 <= cell_density <= 2500:
@@ -120,7 +124,7 @@ def classify_prediction(cell_density, corneal_thickness, cv):
         elif 450 <= corneal_thickness <= 500 and cv <= 40:
             suggested_action = "Borderline case, requires periodic evaluation"
             surgery_type = "Regular eye check-up"
-        else:  
+        else:
             suggested_action = "Possible mild edema, observe over time"
             surgery_type = "Routine check-up"
     elif 2500 <= cell_density <= 3000:
@@ -130,7 +134,7 @@ def classify_prediction(cell_density, corneal_thickness, cv):
         else:
             suggested_action = "Healthy cornea, no intervention required"
             surgery_type = "No surgery needed"
-    else:  
+    else:
         suggested_action = "Very healthy cornea, no intervention required"
         surgery_type = "No surgery needed"
 
@@ -142,8 +146,13 @@ def classify_prediction(cell_density, corneal_thickness, cv):
         "surgery_required": surgery_required
     }
 
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'healthy'}), 200
+
 @app.route('/predict', methods=['POST'])
 def predict():
+    global model
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
@@ -153,27 +162,29 @@ def predict():
         if not allowed_file(file.filename):
             return jsonify({'error': 'Invalid file type'}), 400
         filename = secure_filename(file.filename)
-        temp_path = os.path.join("uploads", filename)
-        os.makedirs("uploads", exist_ok=True)
+        temp_path = os.path.join("/opt/render/project/src/model_storage/uploads", filename)
+        os.makedirs("/opt/render/project/src/model_storage/uploads", exist_ok=True)
         file.save(temp_path)
+        if model is None:
+            model = load_model(MODEL_URL)  # Lazy-load model
         image = preprocess_image(temp_path)
         with torch.no_grad():
             regression_output = model(image)
             regression_output = regression_output.squeeze().cpu().numpy()
             denorm_output = denormalize(regression_output)
         classification = classify_prediction(
-            denorm_output[0], 
-            denorm_output[2], 
-            denorm_output[1] 
+            denorm_output[0],
+            denorm_output[2],
+            denorm_output[1]
         )
-        # Clean up the uploaded file and old files in uploads directory
         os.remove(temp_path)
-        for old_file in glob.glob("uploads/*"):
-            if os.path.getmtime(old_file) < time.time() - 3600:  # Remove files older than 1 hour
+        for old_file in glob.glob("/opt/render/project/src/model_storage/uploads/*"):
+            if os.path.getmtime(old_file) < time.time() - 3600:
                 os.remove(old_file)
+        gc.collect()  # Free memory
         return jsonify({
-            'cell_density': round(float(denorm_output[0]), 2), 
-            'cv': round(float(denorm_output[1]), 2),         
+            'cell_density': round(float(denorm_output[0]), 2),
+            'cv': round(float(denorm_output[1]), 2),
             'corneal_thickness': round(float(denorm_output[2]), 2),
             'suggested_action': classification['suggested_action'],
             'surgery_type': classification['surgery_type'],
@@ -183,4 +194,5 @@ def predict():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=8001)
+    port = int(os.getenv("PORT", 8001))  # Use Render's PORT
+    app.run(debug=False, host='0.0.0.0', port=port)
